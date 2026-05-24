@@ -44,6 +44,12 @@ def import_model_modules(model_name):
     elif model_name.startswith("qwen2vl"):
         from models import load_qwen2vl_model, run_qwen2vl
         return load_qwen2vl_model, run_qwen2vl
+    elif model_name.startswith("molmopoint"):
+        from models import load_molmopoint_model, run_molmopoint
+        return load_molmopoint_model, run_molmopoint
+    elif model_name.startswith("molmo2"):
+        from models import load_molmo2_model, run_molmo2
+        return load_molmo2_model, run_molmo2
     elif model_name.startswith("molmo"):
         from models import load_molmo_model, run_molmo
         return load_molmo_model, run_molmo
@@ -67,7 +73,7 @@ def load_model(model_name, model_path=None):
     load_func, _ = import_model_modules(model_name)
     return load_func(model_path)
 
-def run_model(question, image_path, depth_path, model_name, model_kwargs):
+def run_model(question, image_path, depth_path, model_name, model_kwargs, category=None):
     """
     Generic helper: runs the specified model on a single (question, image[, depth]).
     Returns the string answer from the model.
@@ -88,6 +94,8 @@ def run_model(question, image_path, depth_path, model_name, model_kwargs):
         image_base64 = encode_image(image_path)
         answer = run_func(question, image_base64)
     else:
+        if model_name.startswith("molmopoint") or model_name.startswith("molmo2"):
+            model_kwargs["category"] = category
         answer = run_func(question, image_path, depth_path, model_kwargs)
         
     return answer
@@ -259,6 +267,7 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='Path to YAML config file')
     parser.add_argument('--dry-run', action='store_true', help='Only evaluate the first 3 examples')
     parser.add_argument('--no-progress', action='store_true', help='Disable progress bar output')
+    parser.add_argument('--print-prompts', action='store_true', help='Print prompts sent to MolmoPoint/Molmo2 models')
     parser.add_argument(
         '--num-points-to-match',
         type=int,
@@ -344,6 +353,8 @@ def main():
             
         print(f"Loading model '{model_name}' for RoboSpatial-Home evaluation...")
         model_kwargs = load_model(model_name, model_path)
+        if model_name.startswith("molmopoint") or model_name.startswith("molmo2"):
+            model_kwargs["print_prompts"] = args.print_prompts
         print("Model loaded successfully.")
 
     all_stats = []

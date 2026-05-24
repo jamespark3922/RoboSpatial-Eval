@@ -99,6 +99,258 @@ def load_molmo_model(model_path=None):
     model_kwargs = {"model": model, "processor": processor}
     return model_kwargs
 
+
+def _load_molmo_image_text_model(model_path, default_model_path):
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    model_path = model_path or default_model_path
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        padding_side="left",
+    )
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+    )
+    model.eval()
+    return {
+        "model": model,
+        "processor": processor,
+        "model_path": model_path,
+        "max_new_tokens": 200 if "MolmoPoint" in model_path else 128,
+    }
+
+
+def load_molmopoint_model(model_path=None):
+    return _load_molmo_image_text_model(model_path, "allenai/MolmoPoint-8B")
+
+
+def load_molmo2_model(model_path=None):
+    return _load_molmo_image_text_model(model_path, "allenai/Molmo2-8B")
+
+
+def _first_model_device(model):
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return "cpu"
+
+
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+
+
+def _format_robospatial_pointing_prompt(question):
+    import re
+
+    prompt = str(question).strip()
+    prompt = re.sub(
+        r"\s*Your answer should be formatted as a list of tuples.*$",
+        "",
+        prompt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    prompt = re.sub(
+        r"\bPinpoint several points within\b",
+        "Point to",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    prompt = re.sub(
+        r"\bPinpoint a point within\b",
+        "Point to",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    return prompt.strip()
+
+
+def _format_robospatial_prompt(question, category=None):
+    if str(category).lower() in {"configuration", "compatibility"}:
+        return f"{question}\nAnswer with only yes or no."
+    return _format_robospatial_pointing_prompt(question)
+
+
+def _decode_generated_text(output_ids, inputs, processor):
+    input_len = inputs["input_ids"].shape[-1]
+    generated_tokens = output_ids[:, input_len:]
+    return processor.batch_decode(
+        generated_tokens,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0].strip()
+
+
+def _normalize_point_text_for_robospatial(text):
+    import re
+
+    points = []
+    number_any = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+
+    def add_point(x, y):
+        x = float(x)
+        y = float(y)
+        scale = 1.0
+        max_coord = max(abs(x), abs(y))
+        if max_coord > 100.0:
+            scale = 1000.0
+        elif max_coord > 1.0:
+            scale = 100.0
+        points.append((x / scale, y / scale))
+
+    def add_coord_sequence(coord_text):
+        nums = [float(n) for n in re.findall(number_any, coord_text)]
+        if len(nums) < 2:
+            return
+        # Molmo2 often emits numbered points: id,x,y,id,x,y,...
+        if len(nums) % 3 == 0 and all(nums[i].is_integer() for i in range(0, len(nums), 3)):
+            for i in range(0, len(nums), 3):
+                add_point(nums[i + 1], nums[i + 2])
+                if len(points) >= 2:
+                    return
+            return
+        # Some outputs include a leading "1 1" prefix before x,y.
+        if len(nums) == 4 and nums[0].is_integer() and nums[1].is_integer():
+            add_point(nums[2], nums[3])
+            return
+        for i in range(0, len(nums) - 1, 2):
+            add_point(nums[i], nums[i + 1])
+            if len(points) >= 2:
+                return
+
+    for match in re.finditer(r'<points?\s+coords="([^"]+)"', text):
+        add_coord_sequence(match.group(1))
+        if len(points) >= 2:
+            break
+
+    number = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    patterns = [
+        rf"Click\(\s*{number}\s*,\s*{number}\s*\)",
+        rf"[\(\[]\s*{number}\s*[, ]\s*{number}\s*[\)\]]",
+        rf'x\d*="\s*{number}"\s+y\d*="\s*{number}"',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            try:
+                add_point(match.group(1), match.group(2))
+            except ValueError:
+                continue
+            if len(points) >= 2:
+                break
+        if points:
+            break
+
+    if not points:
+        return text
+    return str([(round(x, 4), round(y, 4)) for x, y in points])
+
+
+def _point_rows_to_normalized_text(points, image_size):
+    width, height = image_size
+    normalized_points = []
+    for point in points:
+        if len(point) < 2:
+            continue
+        x = float(point[-2])
+        y = float(point[-1])
+        normalized_points.append((round(x / width, 4), round(y / height, 4)))
+        if len(normalized_points) >= 2:
+            break
+    return str(normalized_points) if normalized_points else None
+
+
+def _generate_molmo_image_text_answer(question, image_path, kwargs):
+    import torch
+    from PIL import Image
+
+    model = kwargs["model"]
+    processor = kwargs["processor"]
+    category = kwargs.get("category")
+    max_new_tokens = kwargs.get("max_new_tokens", 128)
+    image = Image.open(image_path).convert("RGB")
+    prompt = _format_robospatial_prompt(question, category=category)
+    if kwargs.get("print_prompts"):
+        print("\n" + "=" * 80)
+        print(f"ROBOSPATIAL PROMPT category={category} image={image_path}")
+        print("-" * 80)
+        print(prompt)
+        print("=" * 80)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    use_native_pointing = hasattr(model, "extract_image_points") and hasattr(model, "build_logit_processor_from_inputs")
+    template_kwargs = {
+        "add_generation_prompt": True,
+        "tokenize": True,
+        "return_dict": True,
+        "return_tensors": "pt",
+    }
+    if use_native_pointing:
+        template_kwargs["padding"] = True
+        template_kwargs["return_pointing_metadata"] = True
+
+    inputs = processor.apply_chat_template(messages, **template_kwargs)
+    metadata = inputs.pop("metadata", None)
+    inputs = _move_batch_to_device(inputs, _first_model_device(model))
+
+    device = _first_model_device(model)
+    autocast_enabled = getattr(device, "type", str(device)).startswith("cuda")
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+        generate_kwargs = {}
+        if use_native_pointing:
+            generate_kwargs["logits_processor"] = model.build_logit_processor_from_inputs(inputs)
+        output_ids = model.generate(
+            **inputs,
+            **generate_kwargs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+    if use_native_pointing and metadata is not None:
+        generated_tokens = output_ids[:, inputs["input_ids"].shape[-1]:]
+        if hasattr(processor, "post_process_image_text_to_text"):
+            generated_text = processor.post_process_image_text_to_text(
+                generated_tokens,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )[0]
+        else:
+            generated_text = processor.batch_decode(
+                generated_tokens,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )[0]
+        points = model.extract_image_points(
+            generated_text,
+            metadata["token_pooling"],
+            metadata["subpatch_mapping"],
+            metadata["image_sizes"],
+        )
+        normalized_text = _point_rows_to_normalized_text(points, image.size)
+        if normalized_text:
+            return normalized_text
+    else:
+        generated_text = _decode_generated_text(output_ids, inputs, processor)
+    return _normalize_point_text_for_robospatial(generated_text)
+
+
+def run_molmopoint(question, image_path, depth_path, kwargs):
+    return _generate_molmo_image_text_answer(question, image_path, kwargs)
+
+
+def run_molmo2(question, image_path, depth_path, kwargs):
+    return _generate_molmo_image_text_answer(question, image_path, kwargs)
+
 def load_gpt_model():
     return {}
 

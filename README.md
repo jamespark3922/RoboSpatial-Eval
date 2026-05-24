@@ -201,6 +201,53 @@ The inference code for all models is containerized to allow for isolated evaluat
 #### Molmo
 - `allenai/Molmo-7B-D-0924`
 
+#### MolmoPoint / Molmo2
+
+These local runners use Hugging Face checkpoints through `AutoModelForImageTextToText`.
+
+- CLI model name: `molmopoint`
+  - Default checkpoint: `allenai/MolmoPoint-8B`
+  - Convenience script: `scripts/run_molmopoint_8b.sh`
+- CLI model name: `molmo2`
+  - Default checkpoint: `allenai/Molmo2-8B`
+  - Convenience script: `scripts/run_molmo2_8b.sh`
+
+Recommended setup:
+
+```bash
+pip install numpy tqdm pyyaml datasets pillow accelerate einops torchvision
+pip install transformers==4.57.1
+```
+
+Dry-run before a full evaluation:
+
+```bash
+./scripts/run_molmopoint_8b.sh --dry-run --print-prompts --no-progress
+./scripts/run_molmo2_8b.sh --dry-run --print-prompts --no-progress
+```
+
+`--print-prompts` prints the exact prompt sent to MolmoPoint/Molmo2 for each dry-run example. `--no-progress` keeps those prompt logs readable.
+
+Run full RoboSpatial-Home evaluation:
+
+```bash
+./scripts/run_molmopoint_8b.sh
+./scripts/run_molmo2_8b.sh
+```
+
+Outputs are written under `results/`, including:
+
+- `aggregate_robospatial_home_molmopoint.json`
+- `aggregate_robospatial_home_molmo2.json`
+- per-split prediction files such as `context_molmopoint_results.json`
+
+To use a local checkpoint path instead of downloading from Hugging Face:
+
+```bash
+MODEL_PATH=/path/to/MolmoPoint-8B ./scripts/run_molmopoint_8b.sh
+MODEL_PATH=/path/to/Molmo2-8B ./scripts/run_molmo2_8b.sh
+```
+
 #### GPT-4o
 - `export OPENAI_API_KEY=<Your API Key>`
 

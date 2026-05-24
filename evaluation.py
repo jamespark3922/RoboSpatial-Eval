@@ -313,7 +313,7 @@ def eval_robospatial_home(
         depth_path = os.path.join(data_dir, depth_rel_path) if depth_rel_path else None
 
         # Run the model
-        generated_answer = run_model_fn(question, image_path, depth_path, model_name, model_kwargs)
+        generated_answer = run_model_fn(question, image_path, depth_path, model_name, model_kwargs, category=category)
 
         # Evaluate the answer
         correct, is_binary, parsed_answer, is_parsable = evaluate_answer(
